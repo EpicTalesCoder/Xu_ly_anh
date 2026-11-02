@@ -11,11 +11,20 @@ Thử nghiệm **zero-shot composed image retrieval** (ZS-CIR) theo bài
 ## Bản mini trong repo này
 - `pic2word_kaggle.ipynb` — notebook chạy **Kaggle GPU** (push headless bằng `kaggle kernels push`, không cần mở web).
   - Dữ liệu: Kaggle dataset `aladdinpersson/flickr8kimagescaptions` (Flickr8k, 8000 ảnh + captions.txt).
-  - CLIP ViT-B/32 đóng băng + mapper MLP 2 lớp; train 2000 ảnh × 2 epoch (~10 phút GPU).
+  - CLIP ViT-B/32 đóng băng + mapper MLP 2 lớp; train 2000 ảnh × 2 epoch (~5 phút GPU).
   - Eval self-retrieval Recall@1/5 trên 200 ảnh held-out, có baseline so sánh (raw image embedding không qua mapper).
   - Demo grid ảnh query → top-4 kết quả.
 - `build_pic2word_nb.py` — script sinh lại notebook trên.
+- `results/` — kết quả lần chạy đầu trên Kaggle (kernel `mq3444/pic2word-mini`).
 - `sample_data/` — dữ liệu mẫu mặc định của môi trường notebook (giữ nguyên).
+
+## Kết quả lần chạy 2026-11-02 (2000 ảnh train / 200 ảnh gallery)
+| Phương án | R@1 | R@5 |
+|---|---|---|
+| mapper đã train | 0.080 | 0.300 |
+| raw image embedding (không mapper) | 0.005 | 0.035 |
+
+Mapper tốt hơn hẳn baseline raw (~16× R@1) — cơ chế Pic2Word hoạt động đúng; tuyệt đối còn thấp vì chỉ train 2k ảnh × 2 epoch.
 
 ## Giới hạn (nói thẳng)
 Bản mini chỉ dạy mapper khớp **ảnh gốc** nên chỉ đo được self-retrieval; các template ZS-CIR thật ("a sketch of *", đổi thuộc tính) cần train quy mô CC3M (~3M cặp) như bài gốc mới tổng quát. Đây là demo cơ chế để hiểu phương pháp, không phải tái lập kết quả SOTA.
