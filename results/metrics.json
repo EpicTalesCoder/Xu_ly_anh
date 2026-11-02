@@ -1,0 +1,10 @@
+{
+  "model": "openai/clip-vit-base-patch32",
+  "train_images": 2000,
+  "gallery_images": 200,
+  "epochs": 2,
+  "recall_at1_mapper": 0.07999999821186066,
+  "recall_at5_mapper": 0.29999998211860657,
+  "recall_at1_raw_baseline": 0.004999999888241291,
+  "recall_at5_raw_baseline": 0.03500000014901161
+}

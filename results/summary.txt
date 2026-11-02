@@ -1,0 +1,3 @@
+PIC2WORD MINI — 2000 anh train, 200 anh gallery
+R@1 mapper=0.080  R@5=0.300
+R@1 raw   =0.005  R@5=0.035

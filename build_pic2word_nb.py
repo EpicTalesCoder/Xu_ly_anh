@@ -5,6 +5,16 @@
 pseudo-word token ở vị trí 1 của text input; train InfoNCE trên Flickr8k
 (1 caption/ảnh, pseudo-label smoothing 0.2); eval self-retrieval trên ảnh
 held-out + demo truy xuất. Chạy headless qua `kaggle kernels push`.
+
+Ghi chú kỹ thuật (rút từ các lần chạy lỗi trên Kaggle):
+- KHÔNG gọi clip.text_model(inputs_embeds=...) — bản transformers mới đòi
+  input_ids và báo "multiple values for inputs_embeds". Thay vào đó dùng
+  forward hook trên token_embedding để chèn pseudo-token ở vị trí 1, rồi gọi
+  đường chuẩn text_model(input_ids, attention_mask).
+- KHÔNG dùng clip.get_image_features(**inputs) — trả object khi gói mới;
+  dùng vision_model + visual_projection thủ công.
+- Mount dataset Kaggle: captions.txt và Images có thể KHÔNG nằm cạnh nhau
+  (đường dẫn lồng /kaggle/input/datasets/...) — tìm thư mục ảnh bằng glob.
 """
 import json, pathlib
 
@@ -66,8 +76,7 @@ import pandas as pd
 caps = glob.glob("/kaggle/input/**/captions.txt", recursive=True)
 assert caps, "KHÔNG thấy captions.txt — kiểm tra dataset_sources trong kernel-metadata.json"
 CAP = caps[0]
-IMG_DIR = os.path.join(os.path.dirname(CAP), "Images")
-print("captions:", CAP, "| images dir:", IMG_DIR, "tồn tại:", os.path.isdir(IMG_DIR))
+print("captions:", CAP)
 
 rows = pd.read_csv(CAP)
 if not {"image", "caption"} <= set(rows.columns):  # fallback parse thủ công
@@ -81,8 +90,20 @@ if not {"image", "caption"} <= set(rows.columns):  # fallback parse thủ công
 
 img_cap = rows.dropna().groupby("image").first().reset_index()  # 1 caption/ảnh
 img_cap = img_cap.sample(frac=1.0, random_state=CFG["SEED"]).reset_index(drop=True)
+
+# Tìm thư mục ảnh: mount Kaggle có thể lồng sâu, không nằm cạnh captions.txt
+IMG_DIR = None
+for name in img_cap["image"].head(10):
+    hits = glob.glob(f"/kaggle/input/**/{name}", recursive=True)
+    if hits:
+        IMG_DIR = os.path.dirname(hits[0])
+        break
+assert IMG_DIR, "KHÔNG tìm thấy file ảnh nào dưới /kaggle/input — dataset thiếu ảnh?"
+print("images dir:", IMG_DIR)
+
 img_cap["path"] = img_cap["image"].apply(lambda s: os.path.join(IMG_DIR, s))
 img_cap = img_cap[img_cap["path"].apply(os.path.exists)].reset_index(drop=True)
+assert len(img_cap) > 100, f"Chỉ còn {len(img_cap)} ảnh tồn tại — sai thư mục ảnh?"
 print("Ảnh có sẵn:", len(img_cap), "| caption mẫu:", img_cap["caption"].iloc[0][:80])
 
 train_df = img_cap.iloc[:CFG["MAX_TRAIN_IMAGES"]].reset_index(drop=True)
@@ -105,7 +126,8 @@ def encode_images(paths, bs=64):
     for i in range(0, len(paths), bs):
         imgs = [Image.open(p).convert("RGB") for p in paths[i:i + bs]]
         inputs = proc(images=imgs, return_tensors="pt").to(DEVICE)
-        feats.append(clip.get_image_features(**inputs))
+        out = clip.vision_model(pixel_values=inputs["pixel_values"])
+        feats.append(clip.visual_projection(out.pooler_output))  # [B, 512] — ổn định giữa các bản transformers
     f = torch.cat(feats)
     return f / f.norm(dim=-1, keepdim=True)
 
@@ -115,17 +137,32 @@ print("image features:", tuple(train_img_feat.shape), tuple(gallery_feat.shape))
 
 md("""## 2. Train mapper — InfoNCE + pseudo-label smoothing
 
-Text input: `[BOS, pseudo-token, w2, w3, ...]` — pseudo-token ở **vị trí 1** thay từ đầu tiên của caption, embedding của nó do `mapper(image_embedding)` sinh ra. CLIP text encoder bị đóng băng; gradient chỉ chảy về mapper qua embedding được chèn vào."""),
+Text input: `[BOS, pseudo-token, w2, w3, ...]` — pseudo-token ở **vị trí 1** thay embedding của từ đầu tiên, do `mapper(image_embedding)` sinh ra. CLIP text encoder bị đóng băng; gradient chỉ chảy về mapper qua embedding được chèn vào."""),
 
 code("""import torch.nn.functional as F
 
-def text_forward(img_emb, ids, att):
-    \"\"\"Chèn pseudo-token (từ mapper) vào vị trí 1, trả text features (joint space, normalized).\"\"\"
-    pseudo = mapper(img_emb)                                   # [B, D]
-    emb = clip.text_model.embeddings.token_embedding(ids).clone()  # [B, 77, D]
-    emb[:, 1, :] = pseudo
-    out = clip.text_model(inputs_embeds=emb, attention_mask=att)
-    tfeat = clip.text_projection(out.pooler_output)
+# Chèn pseudo-token bằng forward hook trên token_embedding — đường chuẩn, chạy mọi bản transformers
+# (không dùng inputs_embeds vì bản transformers mới xung đột input_ids/inputs_embeds)
+_pseudo = {}
+def _swap_pseudo(module, inputs, output):
+    v = _pseudo.get("v")
+    if v is None:
+        return output
+    out = output.clone()
+    out[:, 1, :] = v          # vị trí 1 = pseudo-word
+    return out
+
+clip.text_model.embeddings.token_embedding.register_forward_hook(_swap_pseudo)
+
+def text_forward(img_emb, ids, att, use_mapper=True):
+    \"\"\"Encode câu có pseudo-token ở vị trí 1 (mapper(img_emb) nếu use_mapper, không thì raw img_emb).\"\"\"
+    _pseudo["v"] = mapper(img_emb) if use_mapper else img_emb
+    out = clip.text_model(input_ids=ids, attention_mask=att)
+    hs = out.last_hidden_state
+    eot = (ids == tok.eos_token_id).float().argmax(dim=1)   # vị trí token EOS để pooling (chuẩn CLIP)
+    pooled = hs[torch.arange(hs.shape[0], device=hs.device), eot]
+    tfeat = clip.text_projection(pooled)
+    _pseudo.pop("v", None)
     return tfeat / tfeat.norm(dim=-1, keepdim=True)
 
 enc_all = tok(train_df["caption"].tolist(), padding="max_length",
@@ -163,15 +200,8 @@ def eval_retrieval(use_mapper=True):
     B = gallery_feat.shape[0]
     enc = tok([CFG["TEMPLATE"]] * B, padding="max_length", truncation=True,
               max_length=77, return_tensors="pt")
-    q = gallery_feat
-    if use_mapper:
-        tfeat = text_forward(q, enc["input_ids"].to(DEVICE), enc["attention_mask"].to(DEVICE))
-    else:
-        emb = clip.text_model.embeddings.token_embedding(enc["input_ids"].to(DEVICE)).clone()
-        emb[:, 1, :] = q
-        out = clip.text_model(inputs_embeds=emb, attention_mask=enc["attention_mask"].to(DEVICE))
-        tfeat = clip.text_projection(out.pooler_output)
-        tfeat = tfeat / tfeat.norm(dim=-1, keepdim=True)
+    tfeat = text_forward(gallery_feat, enc["input_ids"].to(DEVICE),
+                         enc["attention_mask"].to(DEVICE), use_mapper=use_mapper)
     ranks = (tfeat @ gallery_feat.t()).argsort(dim=1, descending=True)
     gt = torch.arange(B, device=DEVICE)
     r1 = (ranks[:, 0] == gt).float().mean().item()
